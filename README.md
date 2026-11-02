@@ -84,8 +84,13 @@ Explorer 的 shell 动词对**每个**选中项各调用一次本程序（`"%1"`
 
 ## 安装 / 卸载
 
+**不想编译**：到 [Releases](https://github.com/xiu-cpu/new-folder-with-selection/releases) 下载
+`NewFolderWithSelection-v1.0.0.zip`，解压到固定目录后运行里面的 `install.ps1` 即可。
+
+从源码安装：
+
 ```powershell
-# 安装（会先编译，再写 HKCU 注册表）
+# 安装（缺 exe 会先自动编译，再写 HKCU 注册表）
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 
 # 卸载菜单项
