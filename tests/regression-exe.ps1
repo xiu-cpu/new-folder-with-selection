@@ -43,6 +43,11 @@ function Run-Tool {
 }
 function Files-In($d) { @(Get-ChildItem -LiteralPath $d -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) }
 function Esc([string]$s) { $s.Replace('%', '%25').Replace("`t", '%09').Replace("`r", '%0D').Replace("`n", '%0A') }
+function Job-Hash([string]$path) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($path))) -replace '-', '') }
+    finally { $sha.Dispose() }
+}
 
 Write-Host "使用：$exe"
 
@@ -126,13 +131,51 @@ $jobF = Join-Path $root 'E\job.txt'
 $resF = Join-Path $root 'E\res.txt'
 $lines = @((Esc $target), (Esc $resF), (Esc "$src\j1.png"), (Esc "$src\j2.png"))
 [IO.File]::WriteAllLines($jobF, $lines, (New-Object Text.UTF8Encoding($false)))
-$p = Start-Process -FilePath $exe -ArgumentList @('-JobFile', ('"{0}"' -f $jobF)) -Wait -PassThru -WindowStyle Hidden
+$hashF = Job-Hash $jobF
+$p = Start-Process -FilePath $exe -ArgumentList @('-JobFile', ('"{0}"' -f $jobF), '-JobHash', $hashF) -Wait -PassThru -WindowStyle Hidden
 $res = @()
 if (Test-Path -LiteralPath $resF) { $res = @(Get-Content -LiteralPath $resF -Encoding UTF8) }
 Check '子进程 exit 0' ($p.ExitCode -eq 0) "exit=$($p.ExitCode)"
 Check '子进程写了结果文件' ($res.Count -eq 2) ($res -join ' / ')
 Check '子进程结果全部成功' (($res | Where-Object { -not $_.StartsWith('1') }).Count -eq 0) ($res -join ' / ')
 Check '子进程真的把文件移进去了' ((Files-In $target).Count -eq 2) ((Files-In $target) -join ', ')
+
+# =====================================================================
+Write-Host "`n=== E2. job 文件写完又被改：哈希对不上必须整份拒绝 ==="
+$src2   = Join-Path $root 'E2\源'
+New-Item -ItemType Directory -Force -Path $src2 | Out-Null
+foreach ($n in 't1.png', 't2.png') { 'x' | Set-Content -LiteralPath (Join-Path $src2 $n) }
+$target2 = Join-Path $src2 '不该建出来'
+$jobF2   = Join-Path $root 'E2\job.txt'
+$resF2   = Join-Path $root 'E2\res.txt'
+$enc     = New-Object Text.UTF8Encoding($false)
+[IO.File]::WriteAllLines($jobF2, @((Esc $target2), (Esc $resF2), (Esc "$src2\t1.png")), $enc)
+$hash2 = Job-Hash $jobF2
+# 模拟同用户进程在 UAC 那几秒里替换内容（偷加一项）
+[IO.File]::AppendAllText($jobF2, (Esc "$src2\t2.png") + "`r`n", $enc)
+$p2 = Start-Process -FilePath $exe -ArgumentList @('-JobFile', ('"{0}"' -f $jobF2), '-JobHash', $hash2) -Wait -PassThru -WindowStyle Hidden
+Check '篡改后退出码 4（拒绝执行）' ($p2.ExitCode -eq 4) "exit=$($p2.ExitCode)"
+Check '篡改后没建文件夹' (-not (Test-Path -LiteralPath $target2)) 'dir created'
+Check '篡改后文件都还在原处' ((Test-Path -LiteralPath "$src2\t1.png") -and (Test-Path -LiteralPath "$src2\t2.png")) 'file moved'
+
+# =====================================================================
+Write-Host "`n=== E3. job 里混进其他目录的项：只拒绝那一项 ==="
+$src3   = Join-Path $root 'E3\源'
+$other3 = Join-Path $root 'E3\别处'
+New-Item -ItemType Directory -Force -Path $src3, $other3 | Out-Null
+'x' | Set-Content -LiteralPath (Join-Path $src3 'ok.png')
+'x' | Set-Content -LiteralPath (Join-Path $other3 'evil.png')
+$target3 = Join-Path $src3 '只收本目录'
+$jobF3   = Join-Path $root 'E3\job.txt'
+$resF3   = Join-Path $root 'E3\res.txt'
+[IO.File]::WriteAllLines($jobF3, @((Esc $target3), (Esc $resF3), (Esc "$src3\ok.png"), (Esc "$other3\evil.png")), $enc)
+$hash3 = Job-Hash $jobF3
+$p3 = Start-Process -FilePath $exe -ArgumentList @('-JobFile', ('"{0}"' -f $jobF3), '-JobHash', $hash3) -Wait -PassThru -WindowStyle Hidden
+$res3 = @()
+if (Test-Path -LiteralPath $resF3) { $res3 = @(Get-Content -LiteralPath $resF3 -Encoding UTF8) }
+Check '越界项被拒绝（结果里有一行失败）' (($res3 | Where-Object { $_.StartsWith('0') }).Count -eq 1) ($res3 -join ' / ')
+Check '同目录项照常移入' (Test-Path -LiteralPath (Join-Path $target3 'ok.png')) 'not moved'
+Check '别的目录的文件没被搬走' (Test-Path -LiteralPath (Join-Path $other3 'evil.png')) 'evil moved'
 
 # =====================================================================
 Write-Host "`n=== F. 被占用的文件：失败要逐条报出 ==="

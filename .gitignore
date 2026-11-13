@@ -1,5 +1,6 @@
 # 编译产物（build.ps1 / install.ps1 生成）
 NewFolderWithSelection.exe
+NewFolderWithSelection.exe.config
 
 # 调试截图与临时文件
 diag.png

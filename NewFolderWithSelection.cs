@@ -27,6 +27,11 @@ using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
+// 声明目标框架：.NET Framework 4.6.2+ 默认打开长路径支持，不再依赖旁挂的
+// NewFolderWithSelection.exe.config（那个文件丢了就退回 legacy 路径处理，
+// >260 的路径会静默失败）。有了这一行，exe 单独拷到别处也是完整的。
+[assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.8", FrameworkDisplayName = ".NET Framework 4.8")]
+
 namespace NewFolderWithSelection
 {
     // =================================================================
@@ -83,11 +88,21 @@ namespace NewFolderWithSelection
             {
                 string p = Norm(path);
                 if (string.IsNullOrEmpty(p)) return null;
-                string parent = Path.GetDirectoryName(p);
+
+                // Path.GetDirectoryName 对 >260 的路径会抛 PathTooLongException，
+                // 加 \\?\ 前缀才肯算；算完再把前缀去掉
+                bool prefixed = p.Length >= 240 && !p.StartsWith(@"\\?\");
+                string parent = Path.GetDirectoryName(prefixed ? Full(p) : p);
+
                 if (string.IsNullOrEmpty(parent))
                 {
                     if (p.Length >= 2 && p[1] == ':') return p.Substring(0, 2) + "\\";
                     return null;
+                }
+                if (prefixed)
+                {
+                    if (parent.StartsWith(@"\\?\UNC\")) parent = @"\\" + parent.Substring(8);
+                    else if (parent.StartsWith(@"\\?\")) parent = parent.Substring(4);
                 }
                 return Norm(parent);
             }
@@ -106,9 +121,57 @@ namespace NewFolderWithSelection
             catch { return path; }
         }
 
+        // 超过 240 字符就加 \\?\ 前缀：本程序声明了 longPathAware，加上前缀后
+        // 文件系统调用才能突破 260；短路径保持原样，避免改变既有行为
+        public static string Full(string p)
+        {
+            if (string.IsNullOrEmpty(p)) return p;
+            if (p.Length < 240) return p;
+            if (p.StartsWith(@"\\?\")) return p;
+            if (p.StartsWith(@"\\")) return @"\\?\UNC\" + p.Substring(2);
+            return @"\\?\" + p;
+        }
+
         public static bool Exists(string p)
         {
-            return File.Exists(p) || Directory.Exists(p);
+            if (string.IsNullOrEmpty(p)) return false;
+            return File.Exists(Full(p)) || Directory.Exists(Full(p));
+        }
+
+        // 判断“是不是目录”必须走这里：没有 .exe.config 时 Directory.Exists 对 >260
+        // 的路径返回 false，深目录会被当成文件去 File.Move
+        public static bool DirExists(string p)
+        {
+            if (string.IsNullOrEmpty(p)) return false;
+            try { return Directory.Exists(Full(p)); }
+            catch { return false; }
+        }
+
+        public static string Clip(string s, int max)
+        {
+            if (string.IsNullOrEmpty(s) || s.Length <= max) return s;
+            return s.Substring(0, max) + "…";
+        }
+
+        // 长路径下 Directory.CreateDirectory 需要前缀；万一运行库不认前缀就退回普通调用
+        public static void CreateDirectory(string p)
+        {
+            try { Directory.CreateDirectory(Full(p)); }
+            catch (ArgumentException) { Directory.CreateDirectory(p); }
+            catch (NotSupportedException) { Directory.CreateDirectory(p); }
+        }
+
+        // 只删空目录：先确认真的空，非空一律不删（否则“目录非空”会被报成“空目录删不掉”）
+        public static bool DeleteEmptyDir(string p)
+        {
+            try
+            {
+                if (!DirExists(p)) return false;
+                if (Directory.GetFileSystemEntries(Full(p)).Length > 0) return false;
+                Directory.Delete(Full(p), false);
+                return true;
+            }
+            catch { return false; }
         }
 
         public static string Join(string dir, string name)
@@ -130,11 +193,55 @@ namespace NewFolderWithSelection
 
         public static string LogFile { get { return Path.Combine(QDir, "last-run.log"); } }
 
+        // FileMode.Append 不是原子追加（先定位到当时的 EOF 再写），多个进程同时写会
+        // 静默覆盖彼此的行。命名互斥体把“打开→写→关闭”串起来。
+        const long LogMaxBytes = 2 * 1024 * 1024;
+        static Mutex _logMutex;
+        static readonly object _logMutexGate = new object();
+
+        static Mutex LogMutex
+        {
+            get
+            {
+                lock (_logMutexGate)
+                {
+                    if (_logMutex == null)
+                    {
+                        try { _logMutex = new Mutex(false, @"Local\NewFolderWithSelection.log.v1"); }
+                        catch { }
+                    }
+                    return _logMutex;
+                }
+            }
+        }
+
         public static void Log(string msg)
         {
+            Mutex m = LogMutex;
+            bool owned = false;
             try
             {
+                if (m != null)
+                {
+                    try { owned = m.WaitOne(2000); }
+                    catch (AbandonedMutexException) { owned = true; }
+                }
+
                 Directory.CreateDirectory(QDir);
+
+                // 只增不减的日志会到几十 MB：超过 2MB 就转成 .1（只留一份）
+                try
+                {
+                    FileInfo fi = new FileInfo(LogFile);
+                    if (fi.Exists && fi.Length > LogMaxBytes)
+                    {
+                        string bak = LogFile + ".1";
+                        if (File.Exists(bak)) File.Delete(bak);
+                        File.Move(LogFile, bak);
+                    }
+                }
+                catch { }
+
                 string line = "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "] " + msg + "\r\n";
                 byte[] bytes = new UTF8Encoding(false).GetBytes(line);
                 for (int i = 0; i < 20; i++)
@@ -149,6 +256,10 @@ namespace NewFolderWithSelection
                 }
             }
             catch { }
+            finally
+            {
+                if (owned) { try { m.ReleaseMutex(); } catch { } }
+            }
         }
     }
 
@@ -175,22 +286,87 @@ namespace NewFolderWithSelection
 
         public static void Append(string path)
         {
-            byte[] bytes = new UTF8Encoding(false).GetBytes(Esc(path) + "\r\n");
-            for (int i = 0; i < 60; i++)
+            // 行格式：<写入时刻 UTC ticks>\t<escaped path>
+            byte[] bytes = new UTF8Encoding(false).GetBytes(
+                DateTime.UtcNow.Ticks.ToString(CultureInfo.InvariantCulture) + "\t" + Esc(path) + "\r\n");
+
+            Mutex m = QueueMutex;
+            bool owned = false;
+            bool written = false;
+            try
             {
-                try
+                if (m != null)
                 {
-                    using (FileStream fs = new FileStream(QueueFile, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
-                    { fs.Write(bytes, 0, bytes.Length); }
-                    return;
+                    try { owned = m.WaitOne(5000); }
+                    catch (AbandonedMutexException) { owned = true; }
                 }
-                catch { Thread.Sleep(15); }
+                for (int i = 0; i < 60; i++)
+                {
+                    try
+                    {
+                        using (FileStream fs = new FileStream(QueueFile, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
+                        { fs.Write(bytes, 0, bytes.Length); }
+                        written = true;
+                        return;
+                    }
+                    catch { Thread.Sleep(15); }
+                }
             }
+            finally
+            {
+                if (owned) { try { m.ReleaseMutex(); } catch { } }
+                // 60 次重试都失败时这一项会无声消失，至少要在日志里留痕
+                if (!written) Loc.Log("队列追加失败（重试 60 次）：" + path);
+            }
+        }
+
+        // 队列互斥体：.NET Framework 的 FileMode.Append 只是“打开后定位到当前 EOF”，
+        // 15 个进程同时写会互相覆盖（实测丢一半的行），必须串行化。
+        static Mutex _queueMutex;
+        static readonly object _queueMutexGate = new object();
+
+        static Mutex QueueMutex
+        {
+            get
+            {
+                lock (_queueMutexGate)
+                {
+                    if (_queueMutex == null)
+                    {
+                        try { _queueMutex = new Mutex(false, @"Local\NewFolderWithSelection.queue.v1"); }
+                        catch { }
+                    }
+                    return _queueMutex;
+                }
+            }
+        }
+
+        // 本进程只接受“启动前 2 秒之后”写入的队列行：上一次崩溃残留的旧行
+        // 不会被当成这一批的选择（否则用户没选的旧文件也会被搬走）
+        public static readonly long AcceptFromTicks =
+            DateTime.UtcNow.Ticks - TimeSpan.TicksPerSecond * 2;
+
+        public static bool TryParseLine(string line, out string path, out long ticks)
+        {
+            path = null;
+            ticks = 0;
+            if (line == null) return false;
+            line = line.Trim();
+            if (line.Length == 0) return false;
+            int tab = line.IndexOf('\t');
+            if (tab <= 0) return false;   // 旧格式/半截行：当作陈旧数据丢掉
+            if (!long.TryParse(line.Substring(0, tab), NumberStyles.Integer, CultureInfo.InvariantCulture, out ticks))
+                return false;
+            string p = Unesc(line.Substring(tab + 1));
+            if (p.Length == 0) return false;
+            path = p;
+            return true;
         }
 
         public static List<string> ReadQueue()
         {
             List<string> list = new List<string>();
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < 10; i++)
             {
                 try
@@ -201,10 +377,11 @@ namespace NewFolderWithSelection
                         string line;
                         while ((line = sr.ReadLine()) != null)
                         {
-                            line = line.Trim();
-                            if (line.Length == 0) continue;
-                            string p = Unesc(line);
-                            if (!Util.Contains(list, p)) list.Add(p);
+                            string p;
+                            long ticks;
+                            if (!TryParseLine(line, out p, out ticks)) continue;
+                            if (ticks < AcceptFromTicks) continue;
+                            if (seen.Add(p)) list.Add(p);
                         }
                     }
                     return list;
@@ -253,22 +430,150 @@ namespace NewFolderWithSelection
             return !File.Exists(LockFile);
         }
 
+        // 锁文件内容：<pid>|<UTC ticks>。owner 定期续租（心跳），回收只依据
+        // “进程已不存在”或“心跳超过租期”，与对话框开多久无关。
+        const int LeaseMs = 30000;      // 租期：心跳停 30 秒才算过期
+        const int HeartbeatMs = 5000;   // 心跳间隔
+
+        static System.Threading.Timer _lease;
+        static volatile bool _leaseStopped = true;
+        static string _ownerFolder;     // 当前 owner 正在处理的目录，写进锁里
+
+        // pid|UTC ticks|owner 目录（'|' 不是合法文件名字符，可以安全地当分隔符）
+        static string LeasePayload()
+        {
+            return Process.GetCurrentProcess().Id + "|" + DateTime.UtcNow.Ticks + "|" + (_ownerFolder ?? "");
+        }
+
+        static void TouchLease()
+        {
+            if (_leaseStopped) return;
+            // 锁已被回收并重建（内容里的 pid 不是自己）：我们不再是 owner，
+            // 不能再用 FileMode.Create 把别人的锁覆盖回来
+            try
+            {
+                int pid; DateTime beat;
+                if (TryReadLease(out pid, out beat) && pid != Process.GetCurrentProcess().Id)
+                {
+                    StopLease();
+                    return;
+                }
+            }
+            catch { }
+
+            try
+            {
+                byte[] bytes = new UTF8Encoding(false).GetBytes(LeasePayload());
+                using (FileStream fs = new FileStream(LockFile, FileMode.Create, FileAccess.Write,
+                                                      FileShare.ReadWrite | FileShare.Delete))
+                    fs.Write(bytes, 0, bytes.Length);
+            }
+            catch { }
+        }
+
+        // 拿到锁之后调用：立刻写一次心跳，然后每 HeartbeatMs 续一次
+        public static void StartLease()
+        {
+            _leaseStopped = false;
+            TouchLease();
+            _lease = new System.Threading.Timer(delegate { TouchLease(); }, null, HeartbeatMs, HeartbeatMs);
+        }
+
+        static void StopLease()
+        {
+            _leaseStopped = true;
+            System.Threading.Timer t = _lease;
+            _lease = null;
+            if (t != null) { try { t.Dispose(); } catch { } }
+        }
+
+        // 读锁内容；读不出（旧格式空文件 / 正被续租重写）返回 false，调用方退回按时间判断
+        static bool TryReadLease(out int pid, out DateTime beat)
+        {
+            pid = 0;
+            beat = DateTime.MinValue;
+            try
+            {
+                string s;
+                using (FileStream fs = new FileStream(LockFile, FileMode.Open, FileAccess.Read,
+                                                      FileShare.ReadWrite | FileShare.Delete))
+                using (StreamReader sr = new StreamReader(fs, Encoding.UTF8))
+                    s = sr.ReadToEnd().Trim();
+
+                int bar = s.IndexOf('|');
+                if (bar <= 0) return false;
+
+                long ticks;
+                if (!int.TryParse(s.Substring(0, bar), NumberStyles.Integer, CultureInfo.InvariantCulture, out pid)) return false;
+                if (!long.TryParse(s.Substring(bar + 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out ticks)) return false;
+                if (ticks <= 0 || ticks > DateTime.MaxValue.Ticks) return false;
+
+                beat = new DateTime(ticks, DateTimeKind.Utc);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        static bool ProcessAlive(int pid)
+        {
+            if (pid <= 0) return false;
+            try
+            {
+                using (Process p = Process.GetProcessById(pid)) return !p.HasExited;
+            }
+            catch { return false; }
+        }
+
+        // 现 owner 正在处理的目录；读不出或旧格式（没有第三段）返回 null
+        public static string ReadOwnerFolder()
+        {
+            try
+            {
+                string s;
+                using (FileStream fs = new FileStream(LockFile, FileMode.Open, FileAccess.Read,
+                                                      FileShare.ReadWrite | FileShare.Delete))
+                using (StreamReader sr = new StreamReader(fs, Encoding.UTF8))
+                    s = sr.ReadToEnd().Trim();
+
+                string[] parts = s.Split('|');
+                if (parts.Length < 3) return null;
+                string f = parts[2].Trim();
+                return f.Length == 0 ? null : f;
+            }
+            catch { return null; }
+        }
+
         public static void CleanStaleLock()
         {
             try
             {
                 if (!File.Exists(LockFile)) return;
-                if ((DateTime.Now - File.GetLastWriteTime(LockFile)).TotalSeconds > 30)
+
+                int pid; DateTime beat;
+                if (TryReadLease(out pid, out beat))
+                {
+                    // owner 还活着且心跳新鲜 → 不动。窗口开多久都不会被误回收。
+                    if (ProcessAlive(pid) && (DateTime.UtcNow - beat).TotalMilliseconds <= LeaseMs) return;
+                    File.Delete(LockFile);
+                    Loc.Log("回收陈旧锁：pid=" + pid + " 心跳=" + beat.ToString("o", CultureInfo.InvariantCulture));
+                    return;
+                }
+
+                // 读不出内容（旧版本留下的空文件，或恰好读在续租中间）
+                if ((DateTime.UtcNow - File.GetLastWriteTimeUtc(LockFile)).TotalSeconds > 30)
                     File.Delete(LockFile);
             }
             catch { }
         }
 
-        public static bool TryLock()
+        public static bool TryLock(string ownerFolder)
         {
             try
             {
-                using (FileStream fs = new FileStream(LockFile, FileMode.CreateNew, FileAccess.Write, FileShare.None)) { }
+                _ownerFolder = ownerFolder;
+                byte[] bytes = new UTF8Encoding(false).GetBytes(LeasePayload());
+                using (FileStream fs = new FileStream(LockFile, FileMode.CreateNew, FileAccess.Write, FileShare.ReadWrite))
+                    fs.Write(bytes, 0, bytes.Length);
                 return true;
             }
             catch { return false; }
@@ -276,21 +581,38 @@ namespace NewFolderWithSelection
 
         public static void Release()
         {
+            StopLease();
             try { File.Delete(QueueFile); } catch { }
-            try { File.Delete(LockFile); } catch { }
+            try
+            {
+                // 锁里写的已经不是本进程：说明锁被回收后别人拿到了，别误删
+                int pid; DateTime beat;
+                if (File.Exists(LockFile) && TryReadLease(out pid, out beat)
+                    && pid != Process.GetCurrentProcess().Id) return;
+                File.Delete(LockFile);
+            }
+            catch { }
         }
 
         public static void WriteDone(string target, List<string> items)
         {
+            // 先写临时文件再替换：peer 不会读到半截 done.txt 而重复建目录
+            string tmp = DoneFile + "." + Guid.NewGuid().ToString("N") + ".tmp";
             try
             {
                 StringBuilder sb = new StringBuilder();
                 sb.AppendLine(DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture));
                 sb.AppendLine(Esc(target));
                 for (int i = 0; i < items.Count; i++) sb.AppendLine(Esc(items[i]));
-                File.WriteAllText(DoneFile, sb.ToString(), new UTF8Encoding(false));
+                File.WriteAllText(tmp, sb.ToString(), new UTF8Encoding(false));
+                try { File.Replace(tmp, DoneFile, null, true); }
+                catch
+                {
+                    try { File.Delete(DoneFile); } catch { }
+                    File.Move(tmp, DoneFile);
+                }
             }
-            catch { }
+            catch { try { File.Delete(tmp); } catch { } }
         }
 
         public static bool DoneCovers(List<string> incoming)
@@ -318,6 +640,62 @@ namespace NewFolderWithSelection
     }
 
     // =================================================================
+    // 队列增量读：记住已读字节偏移，只解析新追加的行。窗口开着时每 40ms
+    // 全量重读 + 逐行线性查重是 O(n²)，大选择下会把 UI 线程拖住。
+    // =================================================================
+    class QueueTail
+    {
+        long _offset;
+        readonly StringBuilder _carry = new StringBuilder();
+        readonly Decoder _decoder = Encoding.UTF8.GetDecoder();
+
+        public List<string> ReadNew()
+        {
+            List<string> list = new List<string>();
+            try
+            {
+                using (FileStream fs = new FileStream(Store.QueueFile, FileMode.Open, FileAccess.Read,
+                                                      FileShare.ReadWrite | FileShare.Delete))
+                {
+                    if (fs.Length < _offset) { _offset = 0; _carry.Length = 0; }   // 队列被释放后重建
+                    fs.Seek(_offset, SeekOrigin.Begin);
+                    byte[] buf = new byte[8192];
+                    char[] chars = new char[Encoding.UTF8.GetMaxCharCount(buf.Length)];
+                    int n;
+                    while ((n = fs.Read(buf, 0, buf.Length)) > 0)
+                    {
+                        _offset += n;
+                        // Decoder 跨块保持状态：块边界切开的多字节字符不会被拆坏
+                        int cn = _decoder.GetChars(buf, 0, n, chars, 0);
+                        _carry.Append(chars, 0, cn);
+                        Drain(list);
+                    }
+                }
+            }
+            catch (FileNotFoundException) { }
+            catch { }
+            return list;
+        }
+
+        // 只处理完整的行；末尾没有换行的一段留在 _carry 里等下一次
+        void Drain(List<string> into)
+        {
+            int start = 0;
+            for (int i = 0; i < _carry.Length; i++)
+            {
+                if (_carry[i] != '\n') continue;
+                string p;
+                long ticks;
+                if (Store.TryParseLine(_carry.ToString(start, i - start), out p, out ticks)
+                    && ticks >= Store.AcceptFromTicks)
+                    into.Add(p);
+                start = i + 1;
+            }
+            if (start > 0) _carry.Remove(0, start);
+        }
+    }
+
+    // =================================================================
     // 一批待移动项（窗口显示期间持续从队列补入）
     // =================================================================
     class Batch
@@ -325,6 +703,8 @@ namespace NewFolderWithSelection
         readonly object _gate = new object();
         readonly string _folder;
         readonly List<string> _items = new List<string>();
+        readonly HashSet<string> _seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        readonly QueueTail _tail = new QueueTail();
 
         public Batch(string folder) { _folder = folder; }
 
@@ -344,8 +724,9 @@ namespace NewFolderWithSelection
                     string p = paths[i];
                     if (string.IsNullOrEmpty(p)) continue;
                     if (!Util.SamePath(Util.ParentOf(p), _folder)) continue;
-                    if (Util.Contains(_items, p)) continue;
+                    if (_seen.Contains(p)) continue;
                     if (!Util.Exists(p)) continue;
+                    _seen.Add(p);
                     _items.Add(p);
                     changed = true;
                 }
@@ -358,8 +739,8 @@ namespace NewFolderWithSelection
             lock (_gate) return new List<string>(_items);
         }
 
-        // 轮询队列，把新到的项并进来
-        public bool PollQueue() { return Merge(Store.ReadQueue()); }
+        // 轮询队列，把新到的项并进来（增量读，不重扫整个文件）
+        public bool PollQueue() { return Merge(_tail.ReadNew()); }
     }
 
     // =================================================================
@@ -390,7 +771,7 @@ namespace NewFolderWithSelection
 
         static void DoMove(string src, string dst)
         {
-            bool isDir = Directory.Exists(src);
+            bool isDir = Util.DirExists(src);
             Exception first = null;
             try
             {
@@ -409,13 +790,7 @@ namespace NewFolderWithSelection
             catch { throw first; }
         }
 
-        static string LongPath(string p)
-        {
-            if (p.Length < 240) return p;
-            if (p.StartsWith(@"\\?\")) return p;
-            if (p.StartsWith(@"\\")) return @"\\?\UNC\" + p.Substring(2);
-            return @"\\?\" + p;
-        }
+        static string LongPath(string p) { return Util.Full(p); }
 
         static string UniqueDest(string dstDir, string src)
         {
@@ -468,20 +843,42 @@ namespace NewFolderWithSelection
     }
 
     // =================================================================
-    // 提权子进程：NewFolderWithSelection.exe -JobFile <job.txt>
+    // 提权子进程：NewFolderWithSelection.exe -JobFile <job.txt> -JobHash <sha256>
     //   job.txt   第 1 行 = 目标目录，第 2 行 = 结果文件，第 3 行起 = 待移动项
+    //   -JobHash  父进程对 job.txt 原始字节的 SHA-256（十六进制）。子进程只认
+    //             校验通过的那一份字节：写入后被人改过就整份拒绝，不移动任何文件。
     //   res.txt   每行 = ok\t<路径>\t<原因>
     // =================================================================
     static class JobRunner
     {
-        public static int Run(string jobFile)
+        public static string Hash(byte[] data)
+        {
+            using (System.Security.Cryptography.SHA256 sha = System.Security.Cryptography.SHA256.Create())
+                return BitConverter.ToString(sha.ComputeHash(data)).Replace("-", "");
+        }
+
+        public static int Run(string jobFile, string expectedHash)
         {
             string target = null;
             string resultFile = null;
             List<string> items = new List<string>();
+
+            byte[] raw;
+            try { raw = File.ReadAllBytes(jobFile); }
+            catch { return 2; }
+
+            // 先校验字节，再解析同一份字节：中间没有第二次读取，换不掉
+            if (string.IsNullOrEmpty(expectedHash)
+                || !string.Equals(Hash(raw), expectedHash, StringComparison.OrdinalIgnoreCase))
+            {
+                Loc.Log("提权任务校验失败，拒绝执行：" + jobFile);
+                return 4;
+            }
+
             try
             {
-                string[] lines = File.ReadAllLines(jobFile, Encoding.UTF8);
+                string text = new UTF8Encoding(false).GetString(raw);
+                string[] lines = text.Split(new string[] { "\r\n", "\n" }, StringSplitOptions.None);
                 if (lines.Length < 2) return 2;
                 target = Store.Unesc(lines[0].Trim());
                 resultFile = Store.Unesc(lines[1].Trim());
@@ -493,9 +890,18 @@ namespace NewFolderWithSelection
             }
             catch { return 2; }
 
+            // 目标必须是一个有父目录的具体位置（不能是盘根，也不能是空串）
+            string targetParent = Util.ParentOf(target);
+            if (string.IsNullOrEmpty(targetParent))
+            {
+                Loc.Log("提权任务目标无效：" + target);
+                return 2;
+            }
+
             StringBuilder sb = new StringBuilder();
+            bool createdHere = !Util.Exists(target);
             bool dirOk = true;
-            try { Directory.CreateDirectory(target); }
+            try { Util.CreateDirectory(target); }
             catch (Exception ex)
             {
                 dirOk = false;
@@ -505,12 +911,30 @@ namespace NewFolderWithSelection
 
             if (dirOk)
             {
+                int moved = 0;
                 for (int i = 0; i < items.Count; i++)
                 {
+                    // 只允许搬目标文件夹同级的项：跨目录/跨盘一律拒绝
+                    if (!Util.SamePath(Util.ParentOf(items[i]), targetParent))
+                    {
+                        sb.AppendLine("0\t" + Store.Esc(items[i]) + "\t"
+                                      + Store.Esc("拒绝处理：源位置与目标文件夹不在同一目录"));
+                        Loc.Log("提权任务越界项已拒绝：" + items[i]);
+                        continue;
+                    }
                     MoveResult r = Mover.MoveOne(items[i], target);
+                    if (r.Ok) moved++;
                     sb.AppendLine((r.Ok ? "1" : "0") + "\t" + Store.Esc(r.Path) + "\t" + Store.Esc(r.Reason));
                 }
-                Loc.Log("提权子进程完成 " + items.Count + " 项 → " + target);
+                // 一项都没搬成：把刚建的空目录撤掉。提权场景下父进程没权限删，
+                // 只能由这个管理员子进程自己恢复。
+                if (moved == 0 && items.Count > 0 && createdHere && Util.Exists(target))
+                {
+                    bool gone = Util.DeleteEmptyDir(target);
+                    Loc.Log(gone ? "提权子进程全部失败，已回滚空目录：" + target
+                                 : "提权子进程全部失败，空目录删不掉：" + target);
+                }
+                Loc.Log("提权子进程完成 " + moved + "/" + items.Count + " 项 → " + target);
             }
 
             try { File.WriteAllText(resultFile, sb.ToString(), new UTF8Encoding(false)); }
@@ -522,6 +946,8 @@ namespace NewFolderWithSelection
     class ElevResult
     {
         public bool Cancelled;
+        // null = 用户在 UAC 里拒绝了；非 null = 具体失败原因（写任务文件 / 启动进程 / 超时）
+        public string Error;
         public List<MoveResult> Results = new List<MoveResult>();
     }
 
@@ -538,15 +964,23 @@ namespace NewFolderWithSelection
             sb.AppendLine(Store.Esc(target));
             sb.AppendLine(Store.Esc(res));
             for (int i = 0; i < items.Count; i++) sb.AppendLine(Store.Esc(items[i]));
+
+            // 写到磁盘的字节和算哈希的字节是同一份内存缓冲：
+            // 文件名不可预测（GUID），内容被改过子进程会发现哈希对不上
+            byte[] jobBytes = new UTF8Encoding(false).GetBytes(sb.ToString());
+            string jobHash = JobRunner.Hash(jobBytes);
             try
             {
                 Directory.CreateDirectory(Loc.QDir);
-                File.WriteAllText(job, sb.ToString(), new UTF8Encoding(false));
+                using (FileStream fs = new FileStream(job, FileMode.CreateNew, FileAccess.Write, FileShare.Read))
+                    fs.Write(jobBytes, 0, jobBytes.Length);
             }
             catch (Exception ex)
             {
-                Loc.Log("写提权任务失败：" + ex.Message);
+                // 磁盘满 / Temp 被锁 / 目录不可写 —— 这与“用户在 UAC 里点了否”是两件事
+                Loc.Log("写提权任务失败（不是用户拒绝）：" + ex.Message);
                 er.Cancelled = true;
+                er.Error = "无法准备提权任务文件：" + ex.Message;
                 return er;
             }
 
@@ -554,19 +988,37 @@ namespace NewFolderWithSelection
             {
                 ProcessStartInfo psi = new ProcessStartInfo();
                 psi.FileName = Application.ExecutablePath;
-                psi.Arguments = "-JobFile \"" + job + "\"";
+                psi.Arguments = "-JobFile \"" + job + "\" -JobHash " + jobHash;
                 psi.Verb = "runas";
                 psi.UseShellExecute = true;
                 psi.WindowStyle = ProcessWindowStyle.Hidden;
                 psi.WorkingDirectory = Path.GetDirectoryName(Application.ExecutablePath);
                 using (Process p = Process.Start(psi))
                 {
-                    if (p != null) p.WaitForExit();
+                    // 子进程卡住时不能无限干等（现在会没有任何窗口、没有任何提示）
+                    if (p != null && !p.WaitForExit(30000))
+                    {
+                        Loc.Log("提权子进程 30 秒未退出，放弃等待");
+                        try { p.Kill(); } catch { }
+                        try { File.Delete(job); } catch { }
+                        er.Cancelled = true;
+                        er.Error = "管理员进程 30 秒没有响应，已停止等待。";
+                        return er;
+                    }
                 }
             }
             catch (Exception ex)
             {
-                Loc.Log("提权被拒绝或失败：" + ex.Message);
+                System.ComponentModel.Win32Exception we = ex as System.ComponentModel.Win32Exception;
+                if (we != null && we.NativeErrorCode == 1223)   // ERROR_CANCELLED：用户点了“否”
+                {
+                    Loc.Log("提权被用户取消（UAC 1223）");
+                }
+                else
+                {
+                    Loc.Log("提权启动失败（不是用户拒绝）：" + ex.Message);
+                    er.Error = "无法启动管理员进程：" + ex.Message;
+                }
                 try { File.Delete(job); } catch { }
                 er.Cancelled = true;
                 return er;
@@ -587,6 +1039,17 @@ namespace NewFolderWithSelection
                             Path = Store.Unesc(parts[1]),
                             Reason = Store.Unesc(parts[2])
                         });
+                    }
+                    // 声称成功的行回验源路径：结果文件被改过 / 陈旧时不再被当真
+                    for (int i = 0; i < er.Results.Count; i++)
+                    {
+                        MoveResult r = er.Results[i];
+                        if (r.Ok && Util.Exists(r.Path))
+                        {
+                            r.Ok = false;
+                            r.Reason = "结果校验：源路径仍然存在";
+                            Loc.Log("结果回验失败（声称成功但源还在）：" + r.Path);
+                        }
                     }
                 }
             }
@@ -782,37 +1245,69 @@ namespace NewFolderWithSelection
 
     static class Ui
     {
-        static string Pick(string[] candidates, float pt, FontStyle style)
+        static string Pick(string[] candidates, float px, FontStyle style)
         {
             for (int i = 0; i < candidates.Length; i++)
             {
                 try
                 {
-                    Font f = new Font(candidates[i], pt, style, GraphicsUnit.Point);
-                    if (string.Equals(f.FontFamily.Name, candidates[i], StringComparison.OrdinalIgnoreCase))
-                        return candidates[i];
-                    f.Dispose();
+                    using (Font f = new Font(candidates[i], px, style, GraphicsUnit.Pixel))
+                    {
+                        if (string.Equals(f.FontFamily.Name, candidates[i], StringComparison.OrdinalIgnoreCase))
+                            return candidates[i];
+                    }
                 }
                 catch { }
             }
             return null;
         }
 
-        public static Font Font(float pt, bool semibold)
+        // 字体统一按“像素”创建并乘上窗口所在显示器的缩放：Point 单位的 Font.Height
+        // 由创建时的屏幕 DC（主屏/登录 DPI）决定，混合 DPI 下会出现“框按 A 屏放大、
+        // 字按 B 屏画”的错位。
+        static Font Create(float pt, bool semibold, float scale)
         {
+            float px = pt * 96f / 72f * scale;
+            if (px < 1f) px = 1f;
+
             string name;
             FontStyle style = FontStyle.Regular;
             if (semibold)
             {
-                name = Pick(new string[] { "Segoe UI Variable Text Semibold", "Segoe UI Semibold" }, pt, FontStyle.Regular);
-                if (name == null) { name = Pick(new string[] { "Segoe UI" }, pt, FontStyle.Bold); style = FontStyle.Bold; }
+                name = Pick(new string[] { "Segoe UI Variable Text Semibold", "Segoe UI Semibold" }, px, FontStyle.Regular);
+                if (name == null) { name = Pick(new string[] { "Segoe UI" }, px, FontStyle.Bold); style = FontStyle.Bold; }
             }
             else
             {
-                name = Pick(new string[] { "Segoe UI Variable Text", "Segoe UI" }, pt, FontStyle.Regular);
+                name = Pick(new string[] { "Segoe UI Variable Text", "Segoe UI" }, px, FontStyle.Regular);
             }
-            if (name == null) return new Font(FontFamily.GenericSansSerif, pt, style, GraphicsUnit.Point);
-            return new Font(name, pt, style, GraphicsUnit.Point);
+            if (name == null) return new Font(FontFamily.GenericSansSerif, px, style, GraphicsUnit.Pixel);
+            return new Font(name, px, style, GraphicsUnit.Pixel);
+        }
+
+        // 控件自己持有 Font（Control.Font）时用这个：每次新建，避免被 Control.Dispose 影响
+        public static Font OwnFont(float pt, bool semibold, float scale)
+        {
+            return Create(pt, semibold, scale);
+        }
+
+        // 重绘用：同一组参数只建一次，进程生命周期内复用
+        static readonly Dictionary<string, Font> _fonts = new Dictionary<string, Font>();
+        static readonly object _fontGate = new object();
+
+        public static Font Font(float pt, bool semibold, float scale)
+        {
+            float px = pt * 96f / 72f * scale;
+            if (px < 1f) px = 1f;
+            string key = (semibold ? "b" : "r") + "#" + px.ToString("0.##", CultureInfo.InvariantCulture);
+            lock (_fontGate)
+            {
+                Font f;
+                if (_fonts.TryGetValue(key, out f)) return f;
+                f = Create(pt, semibold, scale);
+                _fonts[key] = f;
+                return f;
+            }
         }
 
         public static GraphicsPath Round(RectangleF r, float radius)
@@ -841,7 +1336,23 @@ namespace NewFolderWithSelection
             TextFormatFlags.Left | TextFormatFlags.Top;
 
         // 长路径从中间省略：保留盘符 + 末尾（末尾才是用户要确认的目标目录）
+        // 结果按“宽度 + 字号 + 路径”缓存：逐字符 Measure 最坏要量 250 次
+        static readonly Dictionary<string, string> _fitCache = new Dictionary<string, string>();
+
         public static string FitPath(string prefix, string path, Font f, int width)
+        {
+            string key = width.ToString(CultureInfo.InvariantCulture) + "|"
+                       + f.Height.ToString(CultureInfo.InvariantCulture) + "|" + prefix + "|" + path;
+            string cached;
+            if (_fitCache.TryGetValue(key, out cached)) return cached;
+
+            string result = FitPathCore(prefix, path, f, width);
+            if (_fitCache.Count > 64) _fitCache.Clear();
+            _fitCache[key] = result;
+            return result;
+        }
+
+        static string FitPathCore(string prefix, string path, Font f, int width)
         {
             string full = prefix + path;
             if (Measure(full, f) <= width) return full;
@@ -881,7 +1392,7 @@ namespace NewFolderWithSelection
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw |
                      ControlStyles.SupportsTransparentBackColor, true);
             BackColor = Color.Transparent;
-            Font = Ui.Font(10f, false);
+            Font = Ui.OwnFont(10f, false, S);
             Cursor = Cursors.Hand;
             TabStop = true;
         }
@@ -893,7 +1404,11 @@ namespace NewFolderWithSelection
         protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
         protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
 
-        protected override bool IsInputKey(Keys keyData) { return true; }
+        // 只把 Enter/Space 当成自己的输入键；Tab/方向键要留给窗体做焦点导航
+        protected override bool IsInputKey(Keys keyData)
+        {
+            return keyData == Keys.Enter || keyData == Keys.Space;
+        }
 
         protected override void OnKeyDown(KeyEventArgs e)
         {
@@ -962,7 +1477,7 @@ namespace NewFolderWithSelection
             Box.BorderStyle = BorderStyle.None;
             Box.BackColor = p.Field;
             Box.ForeColor = p.Text;
-            Box.Font = Ui.Font(11f, false);
+            Box.Font = Ui.OwnFont(11f, false, s);
             Box.AutoSize = false;
             Box.GotFocus += delegate { Invalidate(); };
             Box.LostFocus += delegate { Invalidate(); };
@@ -1027,7 +1542,7 @@ namespace NewFolderWithSelection
             AutoScaleMode = AutoScaleMode.None;
             DoubleBuffered = true;
             BackColor = p.Bg;
-            Font = Ui.Font(9.5f, false);
+            Font = Ui.OwnFont(9.5f, false, s);
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
         }
@@ -1118,12 +1633,20 @@ namespace NewFolderWithSelection
         Batch _batch;
         System.Windows.Forms.Timer _poll;
         bool _selStarted;
+        bool _nameEdited;       // 用户动过输入框就不再自动改名
+        bool _nameSuppress;     // 程序自己改输入框时不要当成用户编辑
         public string Value;
 
         public NameDialog(Palette p, float s, string suggested, Batch batch)
             : this(p, s, suggested, batch.Folder, batch.Count)
         {
             _batch = batch;
+            _field.Box.TextChanged += delegate
+            {
+                if (!_nameSuppress) _nameEdited = true;
+            };
+            // 用户点进输入框（哪怕还没打字）就别再自动改名，否则光标会跳
+            _field.Box.MouseDown += delegate { _nameEdited = true; };
         }
 
         // 调试渲染用（不带实时批）
@@ -1165,8 +1688,26 @@ namespace NewFolderWithSelection
         {
             if (_batch == null || IsDisposed) return;
 
-            if (_batch.PollQueue()) RefreshSubtitle();
+            if (_batch.PollQueue()) OnBatchChanged();
             if (!_selStarted && _batch.Count >= 15) StartSelectionRead();
+        }
+
+        // 批次变了：更新“将 N 项”，并（在用户没动手改过名字时）按 README 的规则重算默认名
+        void OnBatchChanged()
+        {
+            RefreshSubtitle();
+            if (_nameEdited) return;
+            string s = Program.SuggestName(_batch.Snapshot());
+            if (string.IsNullOrEmpty(s) || string.Equals(s, _field.Box.Text, StringComparison.Ordinal)) return;
+            _nameSuppress = true;
+            try
+            {
+                _field.Box.Text = s;
+                _field.Box.SelectAll();
+                _field.Text = s;
+            }
+            finally { _nameSuppress = false; }
+            Invalidate(new Rectangle(Px(24), Px(77), Px(412), Px(38)));
         }
 
         void RefreshSubtitle()
@@ -1190,7 +1731,7 @@ namespace NewFolderWithSelection
                     BeginInvoke((MethodInvoker)delegate
                     {
                         if (_batch == null || IsDisposed) return;
-                        if (_batch.Merge(sel)) RefreshSubtitle();
+                        if (_batch.Merge(sel)) OnBatchChanged();
                     });
                 }
                 catch { }
@@ -1273,17 +1814,17 @@ namespace NewFolderWithSelection
             base.OnPaint(e);
             Graphics g = e.Graphics;
 
-            using (Font ft = Ui.Font(13f, true))
-                TextRenderer.DrawText(g, "新建文件夹并移入",
-                    ft, new Rectangle(Px(24), Px(16), Px(412), Px(30)), P.Text, Ui.BaseFlags);
+            Font ft = Ui.Font(13f, true, S);
+            TextRenderer.DrawText(g, "新建文件夹并移入",
+                ft, new Rectangle(Px(24), Px(16), Px(412), Px(30)), P.Text, Ui.BaseFlags);
 
-            using (Font fs = Ui.Font(9.5f, false))
-                TextRenderer.DrawText(g, _sub,
-                    fs, new Rectangle(Px(24), Px(47), Px(412), Px(20)), P.SubText, Ui.BaseFlags);
+            Font fs = Ui.Font(9.5f, false, S);
+            TextRenderer.DrawText(g, _sub,
+                fs, new Rectangle(Px(24), Px(47), Px(412), Px(20)), P.SubText, Ui.BaseFlags);
 
-            using (Font fh = Ui.Font(9f, false))
-                TextRenderer.DrawText(g, Ui.FitPath("位置：", _path, fh, Px(412)),
-                    fh, new Rectangle(Px(24), Px(123), Px(412), Px(18)), P.SubText, Ui.BaseFlags);
+            Font fh = Ui.Font(9f, false, S);
+            TextRenderer.DrawText(g, Ui.FitPath("位置：", _path, fh, Px(412)),
+                fh, new Rectangle(Px(24), Px(123), Px(412), Px(18)), P.SubText, Ui.BaseFlags);
         }
     }
 
@@ -1303,12 +1844,12 @@ namespace NewFolderWithSelection
             _body = body;
             Text = title;
 
-            using (Font fb = Ui.Font(10f, false))
-            {
-                Size sz = TextRenderer.MeasureText(body, fb,
-                    new Size(Px(412), 10000), Ui.WrapFlags);
-                _bodyH = Math.Min(sz.Height, Px(320));
-            }
+            Font fb = Ui.Font(10f, false, s);
+            Size sz = TextRenderer.MeasureText(body, fb,
+                new Size(Px(412), 10000), Ui.WrapFlags);
+            // 8 条失败明细 + 表头/位置行在 10pt 下约 320px，原来正好卡在上限被裁掉；
+            // 放到 460 留出“另有 N 项、日志路径”那两行的位置
+            _bodyH = Math.Min(sz.Height, Px(460));
 
             int h = Px(56) + _bodyH + Px(16) + Px(34) + Px(24);
             ClientSize = new Size(Px(460), h);
@@ -1345,13 +1886,13 @@ namespace NewFolderWithSelection
             base.OnPaint(e);
             Graphics g = e.Graphics;
 
-            using (Font ft = Ui.Font(13f, true))
-                TextRenderer.DrawText(g, _title,
-                    ft, new Rectangle(Px(24), Px(16), Px(412), Px(30)), P.Text, Ui.BaseFlags);
+            Font ft = Ui.Font(13f, true, S);
+            TextRenderer.DrawText(g, _title,
+                ft, new Rectangle(Px(24), Px(16), Px(412), Px(30)), P.Text, Ui.BaseFlags);
 
-            using (Font fb = Ui.Font(10f, false))
-                TextRenderer.DrawText(g, _body,
-                    fb, new Rectangle(Px(24), Px(56), Px(412), _bodyH), P.Text, Ui.WrapFlags);
+            Font fb = Ui.Font(10f, false, S);
+            TextRenderer.DrawText(g, _body,
+                fb, new Rectangle(Px(24), Px(56), Px(412), _bodyH), P.Text, Ui.WrapFlags);
         }
     }
 
@@ -1360,8 +1901,28 @@ namespace NewFolderWithSelection
     // =================================================================
     static class Program
     {
+        // 进程改成 PerMonitorV2 之后，屏幕 DC 只会给出主屏 DPI；
+        // 窗口是跟着鼠标出现的，所以要问“鼠标所在那块屏”的 DPI。
+        [StructLayout(LayoutKind.Sequential)]
+        struct NativePoint { public int X; public int Y; }
+
+        [DllImport("user32.dll")]
+        static extern IntPtr MonitorFromPoint(NativePoint pt, uint flags);
+
+        [DllImport("shcore.dll")]
+        static extern int GetDpiForMonitor(IntPtr hmon, int dpiType, out uint dpiX, out uint dpiY);
+
         static float SystemScale()
         {
+            try
+            {
+                Point cur = Cursor.Position;
+                IntPtr mon = MonitorFromPoint(new NativePoint { X = cur.X, Y = cur.Y }, 2 /*DEFAULTTOPRIMARY*/);
+                uint dx, dy;
+                if (mon != IntPtr.Zero && GetDpiForMonitor(mon, 0 /*EFFECTIVE_DPI*/, out dx, out dy) == 0 && dx > 0)
+                    return dx / 96f;
+            }
+            catch { }
             try
             {
                 using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
@@ -1374,7 +1935,13 @@ namespace NewFolderWithSelection
         static int Main(string[] rawArgs)
         {
             if (rawArgs.Length >= 2 && string.Equals(rawArgs[0], "-JobFile", StringComparison.OrdinalIgnoreCase))
-                return JobRunner.Run(rawArgs[1]);
+            {
+                // 没有 -JobHash 一律拒绝：调用方必须把内容哈希一起交过来
+                string jobHash = null;
+                if (rawArgs.Length >= 4 && string.Equals(rawArgs[2], "-JobHash", StringComparison.OrdinalIgnoreCase))
+                    jobHash = rawArgs[3];
+                return JobRunner.Run(rawArgs[1], jobHash);
+            }
 
             // 无控制台的 winexe 里 stdout 默认是 ANSI，中文会变成 '?'；测试靠它读结果
             try { Console.OutputEncoding = new UTF8Encoding(false); } catch { }
@@ -1410,26 +1977,49 @@ namespace NewFolderWithSelection
             for (int i = 0; i < incoming.Count; i++) Store.Append(incoming[i]);
 
             Store.CleanStaleLock();
-            if (!Store.TryLock())
+            string myFolder = Util.ParentOf(incoming[0]);
+            if (!Store.TryLock(myFolder))
             {
+                // owner 在处理别的目录时，本次调用会被队列的父目录过滤掉，等于“点了没反应”。
+                // 立刻读一次 owner 目录就能判断，不必先干等 1.5 秒。
+                string busy = Store.ReadOwnerFolder();
+                if (busy != null && myFolder != null && !Util.SamePath(busy, myFolder))
+                {
+                    Loc.Log("被另一个目录的处理窗口挡住：" + busy);
+                    ReportOtherFolder(busy);
+                    return 0;
+                }
+
                 // 同批的其他进程可能正在收尾：等它结束，再确认本项是否已被移走。
                 // 若锁一直没释放（窗口还开着），说明项已在队列里，owner 会取走，直接退出即可。
                 Loc.Log("已有主进程，等待其收尾");
                 if (!Store.WaitRelease(1500) || Store.DoneCovers(incoming))
                 {
-                    Loc.Log("已有主进程，本进程退出");
+                    busy = Store.ReadOwnerFolder();
+                    if (busy != null && myFolder != null && !Util.SamePath(busy, myFolder))
+                    {
+                        Loc.Log("窗口仍在处理另一个目录：" + busy);
+                        ReportOtherFolder(busy);
+                    }
+                    else Loc.Log("已有主进程，本进程退出");
                     return 0;
                 }
                 Store.CleanStaleLock();
-                if (!Store.TryLock())
+                if (!Store.TryLock(myFolder))
                 {
                     Loc.Log("已有主进程，本进程退出");
                     return 0;
                 }
             }
 
-            try { return RunOwner(sw, incoming); }
-            finally { }
+            // 异常路径也必须把锁和队列放掉，否则后续调用会被残留锁挡住
+            try
+            {
+                // 拿到锁之后开始续租：窗口开多久锁都不会被判过期
+                Store.StartLease();
+                return RunOwner(sw, incoming);
+            }
+            finally { Store.Release(); }
         }
 
         static int RunOwner(Stopwatch sw, List<string> incoming)
@@ -1510,10 +2100,34 @@ namespace NewFolderWithSelection
                 return 0;
             }
 
+            // 保留名称 / 控制字符：本该在建目录失败时给出“可能只读或受保护”这种误导提示，
+            // 现在提前说清楚（也避免拿它去撞建目录失败、再误判成权限问题弹 UAC）
+            string nameProblem = NameProblem(newName);
+            if (nameProblem != null)
+            {
+                Loc.Log("名字不可用：" + NameDialog.Sanitize(newName));
+                Store.Release();
+                Report(quiet, "新建文件夹并移入", nameProblem + "\n\n这次没有移动任何文件。");
+                return 0;
+            }
+
+            // NTFS 单个名字上限 255。超了就在这里说清楚，不要拿它去撞建目录失败、
+            // 再误判成权限问题去弹 UAC。
+            if (newName.Length > 255)
+            {
+                Loc.Log("名字过长：" + newName.Length + " 字符");
+                Store.Release();
+                Report(quiet, "新建文件夹并移入",
+                    "名字太长：文件夹名最多 255 个字符，当前 " + newName.Length + " 个。\n\n"
+                    + "请缩短后重试。这次没有移动任何文件。");
+                return 0;
+            }
+
             // 收尾：确认之后可能还有极少数迟到进程
             batch.Merge(Store.WaitForQueue(800, 120));
 
-            // 队列到 15 项 ≈ Explorer 的 15 项上限 → 读真实选中项补齐（无窗口路径在这里同步补）
+            // 只有在 Explorer 的 15 项上限被打满（确实可能有项没传进来）时才读 Shell COM：
+            // 多选路径上无条件读会给“窗口已关、文件还没动”加 200–400ms。
             if (batch.Count >= 15)
             {
                 List<string> sel = ExplorerSelection.Get(folderPath);
@@ -1535,36 +2149,45 @@ namespace NewFolderWithSelection
             while (Util.Exists(target)) { target = Util.Join(folderPath, newName + " (" + n + ")"); n++; }
 
             // ---- 建目录 ----
+            // createdHere 用来判断这个空目录是不是我们刚建的：全失败时只回滚自己建的
+            bool createdHere = !Util.Exists(target);
             bool dirReady = false;
             string dirErr = null;
-            try { Directory.CreateDirectory(target); dirReady = true; }
-            catch (Exception ex) { dirErr = ex.Message; Loc.Log("建目录失败：" + ex.Message); }
+            Exception dirEx = null;
+            try { Util.CreateDirectory(target); dirReady = true; }
+            catch (Exception ex) { dirEx = ex; dirErr = ex.Message; Loc.Log("建目录失败：" + ex.Message); }
 
             List<MoveResult> results = new List<MoveResult>();
 
             if (!dirReady)
             {
-                if (Elevator.IsAdmin() || noElev)
+                // 只有真正的权限问题才值得提权；名字非法、磁盘满之类弹 UAC 也没用
+                if (Elevator.IsAdmin() || noElev || dirEx == null || !Mover.IsPermission(dirEx))
                 {
+                    Store.Release();
                     Report(quiet, "新建文件夹并移入",
                         "无法在该位置新建文件夹（可能只读或受保护）。\n\n" + folderPath + "\n\n" + dirErr);
-                    Store.Release();
                     return 0;
                 }
                 Loc.Log("需要管理员权限，提权建目录");
                 ElevResult er = Elevator.Run(items, target);
                 if (er.Cancelled)
                 {
-                    Report(quiet, "新建文件夹并移入", "已取消管理员授权，没有移动任何文件。");
+                    // 锁在弹提示框之前就放掉，用户放着提示框不管时同目录的后续操作不会被挡住
                     Store.Release();
+                    if (er.Error == null)
+                        Report(quiet, "新建文件夹并移入", "已取消管理员授权，没有移动任何文件。");
+                    else
+                        Report(quiet, "新建文件夹并移入",
+                            er.Error + "\n\n没有移动任何文件。\n\n日志：" + Loc.LogFile);
                     return 0;
                 }
                 results = er.Results;
                 if (results.Count == 0)
                 {
+                    Store.Release();
                     Report(quiet, "新建文件夹并移入",
                         "提权没有返回任何结果，文件没有移动。\n\n日志：" + Loc.LogFile);
-                    Store.Release();
                     return 0;
                 }
             }
@@ -1603,6 +2226,16 @@ namespace NewFolderWithSelection
                 else failList.Add(results[i]);
             }
 
+            // 全失败时把刚建的空目录回滚掉：否则会留下一个空的“新建文件夹”，
+            // 提权场景下这个空目录还在受保护位置，用户自己删不掉。
+            bool rolledBack = false;
+            if (okList.Count == 0 && createdHere && Util.Exists(target))
+            {
+                rolledBack = Util.DeleteEmptyDir(target);
+                Loc.Log(rolledBack ? "全部失败，已回滚空目录：" + target
+                                   : "全部失败，但空目录删不掉：" + target);
+            }
+
             if (okList.Count > 0)
             {
                 Store.WriteDone(target, okList);
@@ -1617,18 +2250,24 @@ namespace NewFolderWithSelection
                 for (int i = 0; i < shown; i++)
                 {
                     sb.Append("• ").Append(Util.Leaf(failList[i].Path)).Append('\n');
-                    sb.Append("    ").Append(failList[i].Reason).Append('\n');
+                    // 长异常信息（含整条路径）会被消息框高度上限裁掉，逐条截断
+                    sb.Append("    ").Append(Util.Clip(failList[i].Reason, 100)).Append('\n');
                 }
                 if (failList.Count > shown)
-                    sb.Append("\n…另有 ").Append(failList.Count - shown).Append(" 项，详见日志：\n").Append(Loc.LogFile);
-                else
-                    sb.Append("\n位置：").Append(target);
+                    sb.Append("\n…另有 ").Append(failList.Count - shown).Append(" 项。\n");
+
+                // 回滚过就别再说“位置：”，否则同一段话里既说文件夹在那儿、又说已经删了
+                if (!rolledBack) sb.Append("\n位置：").Append(target);
+                sb.Append("\n日志：").Append(Loc.LogFile);
+                if (rolledBack) sb.Append("\n\n空文件夹已回滚，没有留下空的“新建文件夹”。");
 
                 StringBuilder log = new StringBuilder();
                 for (int i = 0; i < failList.Count; i++)
                     log.Append(failList[i].Path).Append(" :: ").Append(failList[i].Reason).Append(" | ");
                 Loc.Log("失败 " + failList.Count + " 项：" + log.ToString());
 
+                // 移动已经结束、done.txt 也写好了，先放锁再弹模态框
+                Store.Release();
                 Report(quiet, "新建文件夹并移入", sb.ToString());
             }
             else if (results.Count > 0)
@@ -1701,14 +2340,45 @@ namespace NewFolderWithSelection
             catch (Exception ex) { Loc.Log("弹提示失败：" + ex.Message); }
         }
 
+        // 另一个目录的窗口正开着：文案必须说清“不是你点的这个文件夹”
+        static void ReportOtherFolder(string busy)
+        {
+            Report(Util.EnvFlag("NFS_QUIET"), "新建文件夹并移入",
+                "另一个窗口正在处理另一个文件夹里的选中项：\n\n" + busy
+                + "\n\n请先完成或关闭那个窗口，再重试。这次没有移动任何文件。");
+        }
+
+        // 名字本身不可用（Windows 保留名称 / 控制字符）：在弹 UAC 之前给出可读提示
+        static string NameProblem(string name)
+        {
+            for (int i = 0; i < name.Length; i++)
+                if (name[i] < ' ')
+                    return "名字里有不可见字符（控制字符），请删掉后重试。";
+
+            string n = name;
+            int dot = n.IndexOf('.');
+            if (dot >= 0) n = n.Substring(0, dot);
+            n = n.TrimEnd(' ');
+            if (n.Length == 0) return null;
+
+            string u = n.ToUpperInvariant();
+            bool reserved = u == "CON" || u == "PRN" || u == "AUX" || u == "NUL"
+                || (u.Length == 4 && (u.StartsWith("COM", StringComparison.Ordinal) || u.StartsWith("LPT", StringComparison.Ordinal))
+                    && u[3] >= '1' && u[3] <= '9');
+            if (!reserved) return null;
+
+            return "“" + name + "”是 Windows 的保留名称（CON、NUL、COM1 等），不能用作文件夹名。\n\n"
+                 + "请换一个名字重试。";
+        }
+
         // ---- 建议名 ----
-        static string SuggestName(List<string> items)
+        public static string SuggestName(List<string> items)
         {
             string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
             if (items.Count == 1)
             {
                 string p = items[0];
-                if (Directory.Exists(p)) return Util.Leaf(p);
+                if (Util.DirExists(p)) return Util.Leaf(p);
                 string name = Path.GetFileName(p);
                 if (string.IsNullOrEmpty(name)) return "新建文件夹 " + stamp;
                 string noExt = Path.GetFileNameWithoutExtension(name);
@@ -1718,7 +2388,7 @@ namespace NewFolderWithSelection
             List<string> exts = new List<string>();
             for (int i = 0; i < items.Count; i++)
             {
-                if (Directory.Exists(items[i])) continue;
+                if (Util.DirExists(items[i])) continue;
                 string e = Path.GetExtension(items[i]).TrimStart('.').ToLowerInvariant();
                 if (e.Length > 0 && !exts.Contains(e)) exts.Add(e);
             }

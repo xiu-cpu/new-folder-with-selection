@@ -33,5 +33,9 @@ $args = @(
 & $csc $args
 if ($LASTEXITCODE -ne 0) { throw "编译失败，退出码 $LASTEXITCODE" }
 
+# 长路径开关（UseLegacyPathHandling/BlockLongPaths）必须随 exe 一起部署
+$cfg = Join-Path $here 'app.config'
+if (Test-Path $cfg) { Copy-Item -LiteralPath $cfg -Destination ($out + '.config') -Force }
+
 $item = Get-Item $out
 Write-Host ("编译成功：{0}  ({1:N0} 字节)" -f $item.FullName, $item.Length)

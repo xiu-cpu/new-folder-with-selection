@@ -1,4 +1,12 @@
-﻿$ErrorActionPreference = 'Stop'
+﻿# 安全约定：本脚本会真的打开一个 Explorer 窗口，默认不跑。
+# 且**不允许**用 SendKeys / AppActivate 之类的“前台注入”来全选（曾把按键打进用户的前台窗口），
+# 选中一律用 Shell COM 的 SelectItem 完成。
+if ($env:NFS_ALLOW_UI_TESTS -ne '1') {
+    Write-Host 'SKIP regression-over15：会打开真实 Explorer 窗口。需要时设 $env:NFS_ALLOW_UI_TESTS=1。'
+    exit 0
+}
+
+$ErrorActionPreference = 'Stop'
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
 $dir  = Split-Path -Parent $PSScriptRoot
@@ -25,7 +33,6 @@ $all = @(Get-ChildItem -LiteralPath $test -File | ForEach-Object { $_.FullName }
 
 # --- 真实 Explorer 窗口 + 全选 ---
 Start-Process explorer.exe -ArgumentList "`"$test`""
-$wsh   = New-Object -ComObject WScript.Shell
 $shell = New-Object -ComObject Shell.Application
 $win = $null
 for ($i = 0; $i -lt 20; $i++) {
@@ -35,17 +42,13 @@ for ($i = 0; $i -lt 20; $i++) {
 }
 if (-not $win) { Write-Host 'FAIL: 没找到 Explorer 窗口'; exit 1 }
 $folder = $shell.Namespace($test)
-$null = $wsh.AppActivate($win.HWND); Start-Sleep -Milliseconds 300
 $sel = @()
 for ($k = 1; $k -le 4; $k++) {
-    # 用 Shell COM 直接设定选中（不依赖窗口焦点，比 SendKeys 稳）
+    # 用 Shell COM 直接设定选中（不依赖窗口焦点，也不用 SendKeys）
     foreach ($p in $all) {
         try { $win.Document.SelectItem($folder.ParseName((Split-Path -Leaf $p)), 1) } catch {}
     }
     Start-Sleep -Milliseconds 600
-    $sel = @($win.Document.SelectedItems() | ForEach-Object { $_.Path })
-    if ($sel.Count -eq $N) { break }
-    $wsh.SendKeys('^a'); Start-Sleep -Milliseconds 600
     $sel = @($win.Document.SelectedItems() | ForEach-Object { $_.Path })
     if ($sel.Count -eq $N) { break }
 }

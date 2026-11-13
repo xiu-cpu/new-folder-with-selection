@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  New Folder With Selection — 稀疏包（sparse MSIX）定义，用于 Windows 11 主右键菜单。
+  当前状态：未启用。缺 com:Class 指向的原生 NewFolderShellShim.dll（见 ..\shim\NewFolderShellShim.cpp 头部说明）。
+
+  本机实测（Win11 build 26300）：
+    - 未打包的静态 verb / 经典 shellex / 经典 verb + ExplorerCommandHandler 都不会进主菜单；
+    - 进主菜单的第三方项全部是这样一套：AnyContent 稀疏包 + fileExplorerContextMenus + 打包 COM。
+  装：install-shell-menu.ps1（需要开发者模式，否则 Add-AppxPackage -Register 报 0x80073CFF）
+  卸：install-shell-menu.ps1 -Uninstall
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+  xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5"
+  xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap10 desktop4 desktop5 com rescap">
+
+  <Identity Name="NewFolderWithSelection.ShellExtension"
+            Publisher="CN=NFWS-DEV"
+            Version="1.0.0.0"
+            ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>New Folder With Selection</DisplayName>
+    <PublisherDisplayName>NFWS</PublisherDisplayName>
+    <Logo>package\Assets\logo.png</Logo>
+    <!-- 稀疏包关键项：允许清单里的文件落在包外（就是仓库/安装目录） -->
+    <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0" MaxVersionTested="10.0.26300.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="zh-CN" />
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <!-- Executable 相对 ExternalLocation 解析；这里只是声明应用身份，菜单点击由下面的 COM 处理器负责 -->
+    <Application Id="NFWS"
+                 Executable="NewFolderWithSelection.exe"
+                 uap10:TrustLevel="mediumIL"
+                 uap10:RuntimeBehavior="win32App">
+      <uap:VisualElements DisplayName="New Folder With Selection"
+                          Description="把选中的项移入一个新建的文件夹"
+                          BackgroundColor="transparent"
+                          AppListEntry="none"
+                          Square150x150Logo="package\Assets\logo.png"
+                          Square44x44Logo="package\Assets\logo.png" />
+      <Extensions>
+        <desktop4:Extension Category="windows.fileExplorerContextMenus">
+          <desktop4:FileExplorerContextMenus>
+            <desktop5:ItemType Type="*">
+              <desktop5:Verb Id="NewFolderWithSelection" Clsid="3F1B9A62-5C41-4E7D-9A10-7C2B4B6E1F88" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type="Directory">
+              <desktop5:Verb Id="NewFolderWithSelection" Clsid="3F1B9A62-5C41-4E7D-9A10-7C2B4B6E1F88" />
+            </desktop5:ItemType>
+          </desktop4:FileExplorerContextMenus>
+        </desktop4:Extension>
+        <!-- 必须是包内原生 DLL：托管程序集不能作为 SurrogateServer 的 Path -->
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:SurrogateServer DisplayName="New Folder With Selection Shell Extension">
+              <com:Class Id="3F1B9A62-5C41-4E7D-9A10-7C2B4B6E1F88"
+                         Path="NewFolderShellShim.dll"
+                         ThreadingModel="STA" />
+            </com:SurrogateServer>
+          </com:ComServer>
+        </com:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>

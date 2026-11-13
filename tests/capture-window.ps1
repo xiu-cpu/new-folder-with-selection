@@ -9,6 +9,13 @@ param(
     [string]$Title = '新建文件夹并移入'
 )
 $ErrorActionPreference = 'Stop'
+
+# 安全约定：会真的弹一个窗口到桌面，默认不跑；且不抢前台、不注入按键。
+if ($env:NFS_ALLOW_UI_TESTS -ne '1') {
+    Write-Host 'SKIP capture-window：会在桌面弹窗。需要时设 $env:NFS_ALLOW_UI_TESTS=1。'
+    exit 0
+}
+
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
 using System;
@@ -17,7 +24,7 @@ public class Cap {
     [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(IntPtr c, string n);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
 }
@@ -52,8 +59,6 @@ if ($h -eq [IntPtr]::Zero -or -not [Cap]::IsWindowVisible($h)) {
 }
 
 Start-Sleep -Milliseconds 500
-[void][Cap]::SetForegroundWindow($h)
-Start-Sleep -Milliseconds 400
 
 $r = New-Object Cap+RECT
 [void][Cap]::GetWindowRect($h, [ref]$r)
@@ -78,7 +83,9 @@ $ink = 0
 for ($try = 1; $try -le 12; $try++) {
     $bmp = New-Object System.Drawing.Bitmap $w, $ht
     $g = [System.Drawing.Graphics]::FromImage($bmp)
-    $g.CopyFromScreen($r.L, $r.T, 0, 0, (New-Object System.Drawing.Size $w, $ht))
+    # PrintWindow 直接让窗口把自己画进内存 DC：不抢前台、不怕被别的窗口盖住
+    $hdc = $g.GetHdc()
+    try { [void][Cap]::PrintWindow($h, $hdc, 2) } finally { $g.ReleaseHdc($hdc) }
     $ink = Ink $bmp
     if ($ink -ge 800) {
         $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
@@ -86,7 +93,6 @@ for ($try = 1; $try -le 12; $try++) {
         break
     }
     $g.Dispose(); $bmp.Dispose()
-    [void][Cap]::SetForegroundWindow($h)
     Start-Sleep -Milliseconds 250
 }
 if ($ink -lt 800) {
