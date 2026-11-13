@@ -16,6 +16,18 @@
 
 ---
 
+## 下载
+
+最新版：**[v1.1.0](https://github.com/Xiu-CPU/New-Folder-with-Selection/releases/tag/v1.1.0)**
+（`NewFolderWithSelection-v1.1.0.zip`，含 exe + `install.ps1` + `uninstall.ps1` + 本 README）
+
+| 文件 | 大小 | SHA256 |
+|---|---|---|
+| `NewFolderWithSelection.exe` | 51,200 B | `4c418d7b5d4893d166b8faa03699c255a3e24c7f6272a9f2c3c40d7e0d128010` |
+| `NewFolderWithSelection-v1.1.0.zip` | 35,144 B | `34fd728a56268ef2ff475994804a9cc6bb77141eb20f6f91302dae0ed4d64008` |
+
+> 也可以直接用仓库源码编译（见「构建」），两者产物一致。
+
 ## 界面
 
 多选 13 项时的确认卡片（默认名是「文档 + 时间戳」，可直接改；名字会按整批自动重算）：
