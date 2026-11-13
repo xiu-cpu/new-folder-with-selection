@@ -7,3 +7,6 @@ diag.png
 shot-check*.png
 *.user
 .vs/
+
+# Release 打包产物
+NewFolderWithSelection-*.zip
